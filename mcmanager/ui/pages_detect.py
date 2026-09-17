@@ -1,6 +1,12 @@
-"""Dialog that scans the WHOLE filesystem (plus running java processes) of
-the remote machine for existing Minecraft installations and lets the user
-link one to this server entry (adopt)."""
+"""Dialog that scans the remote machine for existing Minecraft
+installations and lets the user link one to this server entry (adopt).
+
+v2.0 (issue 20): the default scan is FAST - running java processes plus
+the directories where Minecraft installs actually live (home, /opt,
+/srv, /data, mounts) with a depth cap.  A full `find /` deep scan is
+available as an explicit second button for installs in unusual places,
+because it can take minutes on big filesystems.
+"""
 from __future__ import annotations
 
 import customtkinter as ctk
@@ -18,9 +24,10 @@ class _Detector(ctk.CTkToplevel):
         self.server = server
         self.on_done = on_done
         self._dots = 0
+        self._deep = False
 
         self.title("Find existing Minecraft servers")
-        self.geometry("680x560")
+        self.geometry("680x580")
         self.configure(fg_color=T.BG)
         self.transient(app)
         self.grab_set()
@@ -30,11 +37,11 @@ class _Detector(ctk.CTkToplevel):
                      font=T.font(17, "bold"), text_color=T.TEXT).pack(pady=(22, 2))
         ctk.CTkLabel(
             self,
-            text="Checks the ENTIRE filesystem - every folder, no fixed path - for Paper /\n"
-                 "Purpur / Folia / Spigot / Bukkit / Fabric / Quilt / Forge / NeoForge /\n"
-                 "Vanilla / Mohist / proxies..., plus every running java process.",
+            text="FAST scan (default): running java processes + common install roots\n"
+                 "(/home, /opt, /srv, /data, mounts) - takes seconds.\n"
+                 "DEEP scan: the ENTIRE filesystem, every folder, no fixed path - slower.",
             font=T.font(11), text_color=T.TEXT_DIM,
-            justify="center").pack(pady=(0, 10))
+            justify="center").pack(pady=(0, 8))
         self.status = ctk.CTkLabel(self, text="searching",
                                    font=T.font(12), text_color=T.AMBER)
         self.status.pack(pady=4)
@@ -43,20 +50,39 @@ class _Detector(ctk.CTkToplevel):
         self._animate()
 
         self.results = ctk.CTkScrollableFrame(self, fg_color=T.BG)
-        self.results.pack(fill="both", expand=True, padx=22, pady=(8, 12))
+        self.results.pack(fill="both", expand=True, padx=22, pady=(8, 6))
         wallpaper.attach(self.results)
         ctk.CTkLabel(self.results, text="Scanning - found servers will appear here...",
                      font=T.font(12), text_color=T.TEXT_DIM,
                      anchor="w").pack(fill="x", padx=14, pady=10)
 
-        GhostButton(self, text="Close", width=110,
-                    command=self.destroy).pack(pady=(0, 16))
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", pady=(0, 14))
+        GhostButton(btns, text="Deep full-disk scan (slow)", width=200,
+                    command=self._deep_scan).pack(side="left", padx=(22, 6))
+        GhostButton(btns, text="Close", width=110,
+                    command=self.destroy).pack(side="right", padx=(6, 22))
 
         self.app.runner.run(
-            lambda: detect.run_detection(self.app.ssh, self.server),
+            lambda: detect.run_detection(self.app.ssh, self.server, deep=False),
             on_success=self._render,
             on_error=lambda e: self._finish_scan() or self.status.configure(
                 text=f"Detection failed: {e}", text_color=T.RED),
+        )
+
+    def _deep_scan(self):
+        if self._scanning:
+            return
+        self._deep = True
+        self._scanning = True
+        self._dots = 0
+        self._animate()
+        self.status.configure(text="starting deep scan...", text_color=T.AMBER)
+        self.app.runner.run(
+            lambda: detect.run_detection(self.app.ssh, self.server, deep=True),
+            on_success=self._render,
+            on_error=lambda e: self._finish_scan() or self.status.configure(
+                text=f"Deep scan failed: {e}", text_color=T.RED),
         )
 
     # ------------------------------------------------------------- animation
@@ -64,7 +90,8 @@ class _Detector(ctk.CTkToplevel):
         if not self.winfo_exists() or not self._scanning:
             return
         self._dots = (self._dots + 1) % 4
-        self.status.configure(text="searching the whole disk" + "." * self._dots)
+        what = "deep-scanning the whole disk" if self._deep else "fast-scanning common roots"
+        self.status.configure(text=what + "." * self._dots)
         self.after(450, self._animate)
 
     def _finish_scan(self) -> None:
@@ -75,15 +102,19 @@ class _Detector(ctk.CTkToplevel):
         if not self.winfo_exists():
             return
         self._scanning = False
+        self._deep = False
         wallpaper.clear(self.results)
         if not candidates:
             card = Card(self.results)
             card.pack(fill="x", pady=6, padx=6)
-            ctk.CTkLabel(card, text="No Minecraft installation found anywhere on the disk.",
+            ctk.CTkLabel(card, text="No Minecraft installation found.",
                          font=T.font(14, "bold"), text_color=T.TEXT).pack(
                 anchor="w", padx=16, pady=(14, 2))
-            ctk.CTkLabel(card, text="Use the Setup Wizard to install one from scratch.",
-                         font=T.font(12), text_color=T.TEXT_DIM).pack(
+            ctk.CTkLabel(card, text="Nothing in the common places. Try the DEEP "
+                                    "full-disk scan, or use the Setup Wizard "
+                                    "to install one from scratch.",
+                         font=T.font(12), text_color=T.TEXT_DIM,
+                         anchor="w", wraplength=560, justify="left").pack(
                 anchor="w", padx=16, pady=(0, 14))
             self.status.configure(text="Scan finished - nothing found",
                                   text_color=T.TEXT_DIM)

@@ -15,8 +15,6 @@
 """
 from __future__ import annotations
 
-import os
-import posixpath
 import time
 from tkinter import messagebox
 
@@ -129,6 +127,13 @@ class PluginsPage(ctk.CTkFrame):
             bar, text="sends 'reload confirm' to the console",
             font=T.font(11), text_color=T.TEXT_DIM)
         self.reload_hint.pack(side="left", padx=12)
+        # v2.0 (issue 16): update check + version tracking for installed mods
+        self.upd_btn = ctk.CTkButton(
+            bar, text="Check updates", width=130, height=42,
+            corner_radius=T.BUTTON_RADIUS, fg_color=T.SURFACE2,
+            hover_color="#242944", text_color=T.TEXT_DIM,
+            font=T.font(12, "bold"), command=self._check_mod_updates)
+        self.upd_btn.pack(side="right")
 
         self.inst_list = ctk.CTkScrollableFrame(tab, fg_color=T.BG)
         self.inst_list.pack(fill="both", expand=True, padx=22, pady=(0, 4))
@@ -524,7 +529,6 @@ class PluginsPage(ctk.CTkFrame):
 
         srv = self.server
         mc_ver = srv.mc_version
-        ptype = PL.project_type(srv.platform)
         loader = PL.loader_for(srv.platform)
 
         def rank(v: dict) -> int:
@@ -557,14 +561,9 @@ class PluginsPage(ctk.CTkFrame):
             if idx < 0:
                 return
             version = versions[idx]
-            file_meta = apis.primary_file(version)
-            url = file_meta.get("url")
-            if not url:
-                self.app.notify("No downloadable file in that build", ok=False)
-                return
             win.destroy()
-            self._download_and_install(url, file_meta.get("filename", "file.jar"),
-                                       ptype)
+            # v2.0: server-side verified install + manifest + dependencies
+            self._install_version(h, version)
 
         ctk.CTkButton(win, text="Download & install on server", height=40,
                       corner_radius=T.BUTTON_RADIUS, fg_color=T.ACCENT,
@@ -574,40 +573,166 @@ class PluginsPage(ctk.CTkFrame):
         ctk.CTkLabel(win, text="Installs to plugins/ or mods/ depending on your platform.",
                      font=T.font(10), text_color=T.TEXT_DIM).pack(pady=(0, 12))
 
-    def _download_and_install(self, url: str, filename: str, ptype: str) -> None:
+    def _install_version(self, project: dict, version: dict) -> None:
+        """v2.0 install path: downloads ON THE SERVER (fast), verifies the
+        Modrinth sha1 (issue 28), records the version in the server-side
+        manifest, keeps the previous jar as a rollback copy in
+        .mcmanager/trash, and auto-installs REQUIRED dependencies (16)."""
+        from .. import updater as UPD
         if self.server is None or self._busy:
             return
         srv = self.server
         self._busy = True
-        folder = "mods" if ptype == "mod" else "plugins"
-        remote = posixpath.join(srv.mc_dir, folder, filename)
-        self._set_status(f"downloading {filename}...", T.AMBER)
+        folder = "mods" if PL.project_type(srv.platform) == "mod" else "plugins"
+        title = project.get("title") or project.get("slug", "plugin")
+        self._set_status(f"installing {title} (verified, with dependencies)...",
+                         T.AMBER)
+
+        def log(line):
+            self.app.runner.emit(
+                lambda l=line: self._set_status(l[:140], T.TEXT_DIM))
 
         def work():
-            local = apis.temp_file(".jar")
-            apis.download_to(url, local)
-            with self.app.ssh.sftp(srv) as sftp:
-                try:
-                    sftp.mkdir(posixpath.join(srv.mc_dir, folder))
-                except OSError:
-                    pass  # already exists
-                sftp.put(str(local), remote)
-            try:
-                os.remove(local)
-            except OSError:
-                pass
-            return filename
+            with self.app.locks.guard(srv.id, "modops"):
+                return UPD.install_mod_version(self.app.ssh, srv, project,
+                                               version, folder, log=log)
 
-        self.app.runner.run(
-            work,
-            on_success=lambda n: (self._set_busy_off(),
-                                  self.app.notify(
-                                      f"{n} installed to {folder}/ - use "
-                                      "'Reload Plugins' or restart to load it"),
-                                  self.refresh_installed()),
-            on_error=lambda e: (self._set_busy_off(),
-                                self._set_status(str(e)[:160], T.RED)),
-        )
+        def ok(name):
+            self._set_busy_off()
+            self.app.notify(f"{name} installed to {folder}/ (sha1 verified) - "
+                            "reload or restart to load it")
+            self.refresh_installed()
+
+        def fail(exc):
+            self._set_busy_off()
+            self._set_status(str(exc)[:160], T.RED)
+            self.app.notify(str(exc)[:160], ok=False)
+
+        self.app.runner.run(work, on_success=ok, on_error=fail)
+
+    # -------------------------------------------------- mod updates (16) ----
+    def _check_mod_updates(self) -> None:
+        from .. import updater as UPD
+        if self.server is None or not self.server.mc_dir or self._busy:
+            return
+        srv = self.server
+        self._busy = True
+        self._set_status("checking Modrinth for newer versions...", T.AMBER)
+
+        def work():
+            return UPD.check_mod_updates(self.app.ssh, srv)
+
+        def ok(updates):
+            self._set_busy_off()
+            if not updates:
+                self.app.notify("All installed mods are up to date "
+                                "(of those installed through the app).")
+                return
+            self._show_mod_updates(updates)
+
+        def fail(exc):
+            self._set_busy_off()
+            self._set_status(str(exc)[:140], T.RED)
+
+        self.app.runner.run(work, on_success=ok, on_error=fail)
+
+    def _show_mod_updates(self, updates: list[dict]) -> None:
+        win = ctk.CTkToplevel(self)
+        win.title("Mod updates")
+        win.geometry("600x420")
+        win.configure(fg_color=T.BG)
+        win.transient(self)
+        win.grab_set()
+        ctk.CTkLabel(win, text="Updates available", font=T.font(15, "bold"),
+                     text_color=T.TEXT).pack(pady=(16, 4))
+        body = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18)
+        for u in updates:
+            row = ctk.CTkFrame(body, fg_color=T.SURFACE, corner_radius=8,
+                               border_width=1, border_color=T.BORDER)
+            row.pack(fill="x", pady=3)
+            txt = ctk.CTkFrame(row, fg_color="transparent")
+            txt.pack(side="left", fill="x", expand=True, padx=10, pady=6)
+            ctk.CTkLabel(txt, text=(u["entry"].get("title")
+                                    or u["entry"].get("slug", "?")),
+                         font=T.font(12, "bold"), text_color=T.TEXT,
+                         anchor="w").pack(fill="x")
+            ctk.CTkLabel(txt,
+                         text=f"{u['entry'].get('version_number', '?')}  ->  "
+                              f"{u['new_number']}   ({u['filename']})",
+                         font=T.mono(10), text_color=T.TEXT_DIM,
+                         anchor="w").pack(fill="x")
+            ctk.CTkButton(row, text="Update", width=80, height=28,
+                          corner_radius=T.BUTTON_RADIUS, fg_color=T.ACCENT,
+                          hover_color=T.ACCENT_DARK, text_color=T.ON_ACCENT,
+                          font=T.font(11, "bold"),
+                          command=lambda uu=u: (win.destroy(),
+                                                self._update_mod(uu))).pack(
+                side="right", padx=8)
+            ctk.CTkButton(row, text="Rollback", width=80, height=28,
+                          corner_radius=T.BUTTON_RADIUS, fg_color=T.SURFACE2,
+                          hover_color="#242944", text_color=T.TEXT_DIM,
+                          font=T.font(11),
+                          command=lambda uu=u: (win.destroy(),
+                                                self._rollback_mod(uu))).pack(
+                side="right", padx=2)
+        ctk.CTkLabel(win, text="updates keep the previous jar in "
+                               ".mcmanager/trash on the server (rollback)",
+                     font=T.font(10), text_color=T.TEXT_DIM).pack(pady=(4, 8))
+
+    def _update_mod(self, u: dict) -> None:
+        from .. import updater as UPD
+        srv = self.server
+        if srv is None or self._busy:
+            return
+        self._busy = True
+        folder = "mods" if PL.project_type(srv.platform) == "mod" else "plugins"
+        name = u["entry"].get("title") or u["filename"]
+        self._set_status(f"updating {name}...", T.AMBER)
+
+        def work():
+            with self.app.locks.guard(srv.id, "modops"):
+                project = {"slug": u["entry"].get("slug"),
+                           "title": u["entry"].get("title", ""),
+                           "project_id": u["entry"].get("project_id", "")}
+                return UPD.install_mod_version(self.app.ssh, srv, project,
+                                               u["new_version"], folder)
+
+        def ok(_):
+            self._set_busy_off()
+            self.app.notify(f"{name} updated to {u['new_number']}")
+            self.refresh_installed()
+
+        def fail(exc):
+            self._set_busy_off()
+            self._set_status(str(exc)[:150], T.RED)
+
+        self.app.runner.run(work, on_success=ok, on_error=fail)
+
+    def _rollback_mod(self, u: dict) -> None:
+        from .. import updater as UPD
+        srv = self.server
+        if srv is None or self._busy:
+            return
+        self._busy = True
+        folder = "mods" if PL.project_type(srv.platform) == "mod" else "plugins"
+        name = u["filename"]
+        self._set_status(f"rolling back {name}...", T.AMBER)
+
+        def work():
+            with self.app.locks.guard(srv.id, "modops"):
+                return UPD.rollback_mod(self.app.ssh, srv, name, folder)
+
+        def ok(_):
+            self._set_busy_off()
+            self.app.notify(f"{name} rolled back to the previous jar")
+            self.refresh_installed()
+
+        def fail(exc):
+            self._set_busy_off()
+            self._set_status(str(exc)[:150], T.RED)
+
+        self.app.runner.run(work, on_success=ok, on_error=fail)
 
 
 # Backwards-compatible name used by app.py

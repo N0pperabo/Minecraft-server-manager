@@ -1,4 +1,20 @@
-"""SSH + SFTP layer built on paramiko (replaces sshj from the Android app)."""
+"""SSH + SFTP layer built on paramiko (replaces sshj from the Android app).
+
+v2.0 changes:
+- HOST KEYS ARE VERIFIED (issue 3): the old AutoAddPolicy accepted any
+  key, which silently enabled man-in-the-middle attacks.  We now use a
+  TOFU store (~/.mcmanager/known_hosts): first connect records the key
+  (the UI may confirm the fingerprint), any later key change REJECTS the
+  connection with a clear alarm.
+- `exec(..., lock=False)` lets long operations (backup tar, jar download,
+  live `tail -F`) run on their own channel while normal commands keep
+  flowing - the per-server lock no longer blocks progress polling.
+- `exec_channel()` returns a raw channel + stdout file for streaming
+  commands (live console) without occupying the lock.
+- transport keepalive prevents idle drops during long operations, and a
+  dropped transport is transparently re-established on the next call
+  (SSH-drop resilience, issue 33).
+"""
 from __future__ import annotations
 
 import socket
@@ -9,6 +25,7 @@ from dataclasses import dataclass
 import paramiko
 
 from .models import Server
+from .secure import HOST_KEYS
 
 CONNECT_TIMEOUT = 12
 
@@ -106,7 +123,8 @@ class SSHManager:
                 self._clients.pop(server.id, None)
 
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            # TOFU host-key verification instead of AutoAddPolicy (issue 3)
+            HOST_KEYS.attach(client)
             try:
                 client.connect(
                     hostname=server.host, port=server.port,
@@ -117,12 +135,22 @@ class SSHManager:
                 )
             except paramiko.AuthenticationException as exc:
                 raise SSHError("Wrong username or password.") from exc
+            except paramiko.BadHostKeyException as exc:
+                raise SSHError(
+                    f"HOST KEY CHANGED for {server.host}! This can mean a "
+                    "man-in-the-middle attack, or that the machine was "
+                    "reinstalled. If you are SURE it is legitimate, remove "
+                    "the old key: Settings -> Manage trusted hosts."
+                ) from exc
             except socket.timeout as exc:
                 raise SSHError(f"Connection timed out ({server.host}:{server.port}).") from exc
             except (socket.error, OSError) as exc:
                 raise SSHError(f"Cannot reach {server.host}:{server.port} - {exc}") from exc
             except paramiko.SSHException as exc:
                 raise SSHError(f"SSH error: {exc}") from exc
+            transport = client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(25)  # survive idle NAT/firewall drops
             self._clients[server.id] = client
             return client
 
@@ -140,20 +168,35 @@ class SSHManager:
             self.close(sid)
 
     # ---- one-shot commands ------------------------------------------------
-    def exec(self, server: Server, command: str, timeout: float | None = 60) -> ExecResult:
-        client = self.connect(server)
-        with self._lock_for(server.id):
-            _stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-            out = stdout.read().decode("utf-8", errors="replace")
-            err = stderr.read().decode("utf-8", errors="replace")
-            code = 0
-            try:
-                code = stdout.channel.recv_exit_status()
-            except Exception:  # noqa: BLE001
-                code = -1
-            return ExecResult(code, out, err)
+    def exec(self, server: Server, command: str, timeout: float | None = 60,
+             lock: bool = True) -> ExecResult:
+        """Run a command and collect stdout/stderr/exit code.
 
-    def exec_stream(self, server: Server, command: str, on_line, timeout: float | None = None) -> int:
+        lock=False: run on a dedicated channel WITHOUT holding the
+        per-server lock - used by long-running operations (tar backup,
+        jar download) so the UI can poll progress with normal exec()s.
+        """
+        if lock:
+            client = self.connect(server)
+            with self._lock_for(server.id):
+                return self._exec_on(client, command, timeout)
+        client = self.connect(server)  # lock-free long op on its own channel
+        return self._exec_on(client, command, timeout)
+
+    def _exec_on(self, client: paramiko.SSHClient, command: str,
+                 timeout: float | None) -> ExecResult:
+        _stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        code = 0
+        try:
+            code = stdout.channel.recv_exit_status()
+        except Exception:  # noqa: BLE001
+            code = -1
+        return ExecResult(code, out, err)
+
+    def exec_stream(self, server: Server, command: str, on_line,
+                    timeout: float | None = None) -> int:
         """Run a command, streaming every stdout line to on_line (blocking)."""
         client = self.connect(server)
         with self._lock_for(server.id):
@@ -168,6 +211,16 @@ class SSHManager:
             except Exception:  # noqa: BLE001
                 code = -1
             return code
+
+    def exec_channel(self, server: Server, command: str,
+                     timeout: float | None = None):
+        """Open a LONG-RUNNING command on its own channel (no per-server
+        lock held).  Returns (stdout_file_object, channel); the caller MUST
+        close the channel when done.  Used by the live console stream
+        (`tail -F logs/latest.log`)."""
+        client = self.connect(server)
+        _stdin, stdout, _stderr = client.exec_command(command, timeout=timeout)
+        return stdout, stdout.channel
 
     @contextmanager
     def sftp(self, server: Server):

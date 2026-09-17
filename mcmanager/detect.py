@@ -60,6 +60,19 @@ FIND_CMD = (
     " \\) -print 2>/dev/null | head -150"
 )
 
+# v2.0 (issue 20): a full `find /` can take minutes on big filesystems,
+# huge backups or network mounts.  The FAST pass only searches the roots
+# where Minecraft installs actually live (home dirs, /opt, /srv, /data,
+# mounted drives) with a depth cap and a 60s budget - typically <3 s.
+# The whole-disk pass stays available as an explicit opt-in in the UI.
+FAST_FIND_CMD = (
+    'nice -n 19 timeout 60 find "$HOME" /root /home /opt /srv /var/games '
+    '/data /mnt /media -maxdepth 7 '
+    "\\( -name node_modules -o -name .cache -o -name .git -o -name backups "
+    "\\) -prune -o -type f \\( " + _JARS + " -o " + _MARKERS +
+    " \\) -print 2>/dev/null | head -120"
+)
+
 # jar basename -> platform (specific names first)
 JAR_PLATFORMS = [
     ("paper", "paper"), ("purpur", "purpur"), ("folia", "folia"),
@@ -121,9 +134,16 @@ def scan_processes(ssh: SSHManager, server: Server) -> list[dict]:
 
 
 # ----------------------------------------------------- pass 2: whole disk ---
-def deep_scan_dirs(ssh: SSHManager, server: Server) -> list[str]:
-    """Run find across the whole filesystem, return unique parent dirs."""
-    res = ssh.exec(server, FIND_CMD, timeout=260)
+def deep_scan_dirs(ssh: SSHManager, server: Server,
+                   deep: bool = False) -> list[str]:
+    """Find MC-marker files and return unique parent dirs.
+
+    deep=False (default): targeted roots + depth cap, ~seconds.
+    deep=True: the entire filesystem (use when the fast pass found
+    nothing and you are sure an install exists somewhere unusual).
+    """
+    cmd = FIND_CMD if deep else FAST_FIND_CMD
+    res = ssh.exec(server, cmd, timeout=260 if deep else 70)
     dirs: list[str] = []
     for line in res.stdout.splitlines():
         line = line.strip()
@@ -278,9 +298,14 @@ def _finalize(info: dict) -> bool:
 
 
 # --------------------------------------------------------------- top level --
-def run_detection(ssh: SSHManager, server: Server) -> list[dict]:
-    """Search the machine (processes + whole filesystem) and classify every
-    directory that looks like an MC server. Running servers come first."""
+def run_detection(ssh: SSHManager, server: Server,
+                  deep: bool = False) -> list[dict]:
+    """Search the machine (running processes + filesystem) and classify
+    every directory that looks like an MC server. Running servers first.
+
+    deep=False runs the FAST targeted scan (issue 20); deep=True scans
+    the entire filesystem for installs in unusual places.
+    """
     found: dict[str, dict] = {}
     order: list[str] = []
 
@@ -310,9 +335,9 @@ def run_detection(ssh: SSHManager, server: Server) -> list[dict]:
         found[d] = info
         order.append(d)
 
-    # pass 2 - the entire filesystem
+    # pass 2 - filesystem scan (fast targeted by default, deep opt-in)
     try:
-        dirs = deep_scan_dirs(ssh, server)
+        dirs = deep_scan_dirs(ssh, server, deep=deep)
     except Exception:  # noqa: BLE001
         dirs = []
     pending = [d for d in dirs if d not in found]
@@ -349,6 +374,8 @@ def refresh_server_info(ssh: SSHManager, server: Server) -> dict | None:
         server.platform = info["platform"]
     if info.get("version"):
         server.mc_version = info["version"]
+    if str(info.get("port") or "").isdigit():
+        server.mc_port = int(info["port"])  # for the SLP health check
     if not server.external_screen:
         try:
             for p in scan_processes(ssh, server):
@@ -436,10 +463,12 @@ def adopt(ssh: SSHManager, server: Server, cand: dict, ram_mb: int) -> str:
         notes.append("start.sh created to launch Forge's run.sh.")
     elif jars:
         jar = _main_jar(jars, cand.get("platform", ""))
+        java_bin = server.java_path or "java"
+        extra = (" " + server.extra_jvm) if server.extra_jvm else ""
         ssh.exec(
             server,
             f"cd {d} && printf '#!/usr/bin/env bash\\ncd \"$(dirname \"$0\")\"\\n"
-            f"exec java -Xms512M -Xmx{server.ram_mb}M -jar {shq(jar)} nogui\\n' "
+            f"exec {shq(java_bin)} -Xms512M -Xmx{server.ram_mb}M{extra} -jar {shq(jar)} nogui\\n' "
             "> start.sh && chmod +x start.sh",
             timeout=20,
         )

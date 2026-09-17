@@ -1,10 +1,19 @@
-"""Server lifecycle control: start/stop/restart via GNU screen, console tail,
-command sending and live monitor stats.
+"""Server lifecycle control + console channels.
 
-For ADOPTED (imported) servers the control layer automatically uses:
-- the screen session the server was already running in (external_screen), or
-- RCON over an SSH tunnel (enable-rcon in server.properties), or
-- a polite SIGTERM (java treats it as a graceful stop) as last resort.
+v2.0 changes:
+- RUNNER MODES (issue 21): the server can be started through GNU screen,
+  tmux, or DIRECT mode (setsid + pidfile + logs/stdout.log) which needs
+  NEITHER - process management no longer depends on screen being
+  installed.  Server.runner picks the mode; 'auto' tries screen, then
+  tmux, then direct.
+- LIVE CONSOLE (issue 10): ConsoleStream tails logs/latest.log with
+  `tail -F` over a dedicated SSH channel - lines arrive the moment the
+  server writes them (and the stream survives log rotation), instead of
+  the old 2.5 s polling.  RCON answers are echoed back when available.
+- send_command() now returns (channel, response) - through RCON the
+  console page shows the command's actual answer (list -> player list).
+- mc_port is auto-read from server.properties so the SLP health check
+  pings the right port.
 """
 from __future__ import annotations
 
@@ -12,6 +21,7 @@ import posixpath
 import re
 import secrets
 import struct
+import threading
 import time
 
 from .models import Server
@@ -64,8 +74,6 @@ class ServerControl:
 
     def _screen_ancestor_name(self, server: Server, java_pid: str,
                               pairs: list[tuple[str, str]]) -> str:
-        """Walk the java process up the parent chain; if a GNU screen
-        process is found on the way, return that session's name."""
         script = (
             f"par={java_pid}; "
             "for i in 1 2 3 4 5 6 7 8; do "
@@ -81,8 +89,6 @@ class ServerControl:
         return ""
 
     def _resolve_screen(self, server: Server) -> str:
-        """Best-matching screen session for this server, whatever its name
-        is and wherever the server was started - never a fixed path."""
         pairs = self._screen_map(server)
         names = [n for _p, n in pairs]
         for cand in (server.external_screen, server.screen_tag):
@@ -98,21 +104,43 @@ class ServerControl:
             if owner:
                 return owner
             if len(names) == 1:
-                return names[0]  # only one screen session and our java runs
+                return names[0]
         return ""
 
     def mc_pid(self, server: Server) -> str:
-        """PID of the java process whose cwd is the server dir ('' if none)."""
+        """PID of the java process whose cwd is the server dir ('' if none).
+        Direct-mode pidfile is checked too."""
         if not server.mc_dir:
             return ""
+        pidfile = posixpath.join(server.mc_dir, ".mcmanager", "pid")
         script = (
-            f"for p in $(pgrep -x java 2>/dev/null); do "
-            f"c=$(readlink /proc/$p/cwd 2>/dev/null); "
+            f"p={shq(pidfile)}; "
+            'if [ -s "$p" ]; then '
+            'q=$(cat "$p"); '
+            'if [ -d "/proc/$q" ] && grep -qa java "/proc/$q/cmdline" 2>/dev/null; then echo "$q"; exit 0; fi; '
+            "fi; "
+            "for p in $(pgrep -x java 2>/dev/null); do "
+            "c=$(readlink /proc/$p/cwd 2>/dev/null); "
             f"[ \"$c\" = {shq(server.mc_dir)} ] && echo $p && break; done"
         )
         res = self.ssh.exec(server, script, timeout=25)
         out = res.stdout.strip()
         return out.splitlines()[0] if out else ""
+
+    def read_mc_port(self, server: Server) -> int:
+        """server-port from server.properties (for the SLP health check)."""
+        if not server.mc_dir:
+            return server.mc_port or 25565
+        props = posixpath.join(server.mc_dir, "server.properties")
+        res = self.ssh.exec(
+            server,
+            f"grep -m1 '^server-port=' {shq(props)} 2>/dev/null | cut -d= -f2",
+            timeout=15)
+        val = res.stdout.strip()
+        if val.isdigit() and 0 < int(val) < 65536:
+            server.mc_port = int(val)
+            return server.mc_port
+        return server.mc_port or 25565
 
     def _rcon(self, server: Server, command: str) -> str:
         if not server.rcon_port:
@@ -145,7 +173,8 @@ class ServerControl:
     # ---------------------------------------------------------------- core --
     def status(self, server: Server) -> bool:
         """Running = our screen OR the adopted external screen OR a java
-        process whose working directory is the server folder."""
+        process whose working directory is the server folder (covers the
+        direct runner mode)."""
         names = self._screen_names(server)
         if server.external_screen and server.external_screen in names:
             return True
@@ -155,14 +184,8 @@ class ServerControl:
             return True
         return False
 
-    def start(self, server: Server, log=None) -> None:
-        if not server.mc_dir:
-            raise RuntimeError("No install folder linked - run the Setup "
-                               "Wizard or 'Find existing installs' first.")
-        if self.status(server):
-            raise RuntimeError("The server is already running.")
-        if log:
-            log(f"[start] launching screen session '{server.screen_tag}' in {server.mc_dir}")
+    # -- runner modes (issue 21) ---------------------------------------------
+    def _start_screen(self, server: Server) -> None:
         script = (
             f"cd {shq(server.mc_dir)} && "
             "if [ -f start.sh ]; then "
@@ -176,8 +199,73 @@ class ServerControl:
         if res.exit_code != 0:
             raise RuntimeError(res.stderr.strip() or res.stdout.strip()
                                or "start.sh failed - check the directory.")
+
+    def _start_tmux(self, server: Server) -> None:
+        script = (
+            f"cd {shq(server.mc_dir)} && "
+            "if [ -f start.sh ]; then s=start.sh; elif [ -f run.sh ]; then s=run.sh; "
+            "else echo 'NO_START_SCRIPT: no start.sh or run.sh in this folder'; exit 1; fi; "
+            f"tmux new-session -d -s {shq(server.screen_tag)} \"bash \\$s\" && "
+            "echo TMUX_UP"
+        )
+        res = self.ssh.exec(server, script, timeout=30)
+        if "TMUX_UP" not in res.stdout:
+            raise RuntimeError(res.stderr.strip() or "tmux start failed.")
+
+    def _start_direct(self, server: Server) -> None:
+        """No screen, no tmux: setsid + pidfile + stdout log (issue 21)."""
+        script = (
+            f"cd {shq(server.mc_dir)} && mkdir -p .mcmanager logs && "
+            "if [ -f start.sh ]; then s=start.sh; elif [ -f run.sh ]; then s=run.sh; "
+            "else echo 'NO_START_SCRIPT: no start.sh or run.sh in this folder'; exit 1; fi; "
+            "setsid nohup bash \"$s\" >> logs/stdout.log 2>&1 < /dev/null & "
+            'echo $! > .mcmanager/pid && sleep 1 && '
+            'kill -0 $(cat .mcmanager/pid) 2>/dev/null && echo DIRECT_UP'
+        )
+        res = self.ssh.exec(server, script, timeout=30)
+        if "DIRECT_UP" not in res.stdout:
+            raise RuntimeError(res.stderr.strip() or res.stdout.strip()
+                               or "direct start failed - see logs/stdout.log")
+
+    def start(self, server: Server, log=None) -> None:
+        if not server.mc_dir:
+            raise RuntimeError("No install folder linked - run the Setup "
+                               "Wizard or 'Find existing installs' first.")
+        if self.status(server):
+            raise RuntimeError("The server is already running.")
         if log:
-            log("[start] session is up - attach with Console or Terminal.")
+            log(f"[start] launching in {server.mc_dir} "
+                f"(runner: {server.runner})")
+        mode = (server.runner or "auto").lower()
+        errors: list[str] = []
+        order = {
+            "auto": ("screen", "tmux", "direct"),
+            "screen": ("screen", "tmux", "direct"),
+            "tmux": ("tmux", "screen", "direct"),
+            "direct": ("direct",),
+        }.get(mode, ("screen", "tmux", "direct"))
+        for step in order:
+            try:
+                if step == "screen":
+                    self._start_screen(server)
+                    server.external_screen = ""
+                elif step == "tmux":
+                    self._start_tmux(server)
+                    server.external_screen = ""
+                else:
+                    self._start_direct(server)
+                    server.external_screen = ""
+                if log:
+                    log(f"[start] session is up ({step} mode).")
+                self.read_mc_port(server)
+                return
+            except RuntimeError as exc:
+                if "NO_START_SCRIPT" in str(exc):
+                    raise
+                errors.append(f"{step}: {exc}")
+                if log:
+                    log(f"[start] {step} mode unavailable - {str(exc)[:90]}")
+        raise RuntimeError(" | ".join(errors) or "start failed")
 
     def stop(self, server: Server, log=None) -> None:
         pid = self.mc_pid(server)
@@ -207,6 +295,10 @@ class ServerControl:
                 return
         for t in {server.screen_tag, server.external_screen} - {""}:
             self.ssh.exec(server, f"screen -S {shq(t)} -X quit; true", timeout=15)
+            self.ssh.exec(server, f"tmux kill-session -t {shq(t)} 2>/dev/null; true",
+                          timeout=15)
+        if pid:
+            self.ssh.exec(server, f"kill -KILL {pid} 2>/dev/null; true", timeout=15)
         time.sleep(2)
         if self.status(server) and log:
             log("[stop] still running - stop it from the Terminal page.")
@@ -233,7 +325,7 @@ class ServerControl:
         return offset
 
     def console_poll(self, server: Server) -> list[str]:
-        """Return new console lines since the last poll (and update offset)."""
+        """Return new console lines since the last poll (fallback path)."""
         offset = self.console_offsets.get(server.id, 0)
         res = self.ssh.exec(
             server,
@@ -257,27 +349,22 @@ class ServerControl:
     # ------------------------------------------------------------ send keys
     @staticmethod
     def _stuff_eval(target: str, command: str, with_p: bool) -> str:
-        """POSIX-safe screen keystuffing: screen itself parses ^M as Enter,
-        so this works under bash / dash / zsh / fish login shells alike."""
         esc = command.replace("\\", "\\\\").replace('"', '\\"')
         p = "-p 0 " if with_p else ""
         return (f"screen -S {shq(target)} {p}-X eval "
                 f"'stuff \"{esc}\"' 'stuff \"^M\"'")
 
     def _send_screen(self, server: Server, target: str, command: str) -> bool:
-        # 1) works on every login shell (screen interprets ^M)
         res = self.ssh.exec(server, self._stuff_eval(target, command, True),
                             timeout=15)
         if res.exit_code == 0:
             return True
-        # 2) ANSI-C newline form (bash/zsh shells)
         safe = command.replace("'", "'\\''")
         res = self.ssh.exec(
             server, f"screen -S {shq(target)} -p 0 -X stuff $'{safe}\\n'",
             timeout=15)
         if res.exit_code == 0:
             return True
-        # 3) older screen builds without -p on -X
         res = self.ssh.exec(server, self._stuff_eval(target, command, False),
                             timeout=15)
         return res.exit_code == 0
@@ -302,34 +389,32 @@ class ServerControl:
             timeout=15)
         return res.exit_code == 0
 
-    def send_command(self, server: Server, command: str) -> str:
-        """Deliver a console command and return the channel used.
-        Order: any matching screen session (found dynamically - the server
-        may have been started outside the app, with any session name) ->
-        tmux -> RCON."""
+    def send_command(self, server: Server, command: str) -> tuple[str, str]:
+        """Deliver a console command; returns (channel_desc, rcon_answer).
+
+        Through RCON the server's ANSWER comes back and is shown in the
+        console page (issue 10); screen/tmux deliver keystrokes only.
+        """
         if not command:
-            return ""
+            return "", ""
         target = self._resolve_screen(server)
         if target:
             if self._send_screen(server, target, command):
                 if server.external_screen != target:
-                    server.external_screen = target  # remember what worked
-                return f"screen session '{target}'"
+                    server.external_screen = target
+                return f"screen session '{target}'", ""
         if self._send_tmux(server, command):
-            return "tmux session"
+            return "tmux session", ""
         if server.rcon_port:
-            self._rcon(server, command)
-            return f"RCON port {server.rcon_port}"
+            answer = self._rcon(server, command)
+            return f"RCON port {server.rcon_port}", answer
         raise RuntimeError(
             "No console channel found - no screen/tmux session matches this "
             "server and RCON is off. Accept the automatic fix (enables RCON "
             "for you) or start the server from the Control page.")
 
-    # ---------------------------------------------------------------- rcon fix
+    # --------------------------------------------------------------- rcon fix
     def enable_rcon(self, server: Server, log=None) -> str:
-        """Write enable-rcon / rcon.port / rcon.password into
-        server.properties so the app NEVER asks the user to edit settings
-        by hand. Takes effect after the next (re)start."""
         if not server.mc_dir:
             raise RuntimeError("No install folder linked.")
         props = posixpath.join(server.mc_dir, "server.properties")
@@ -399,3 +484,86 @@ class ServerControl:
         except (ValueError, IndexError):
             pass
         return stats
+
+
+# ===================================================== live console (10) ====
+class ConsoleStream:
+    """Push-based live console: `tail -n 120 -F logs/latest.log` on a
+    dedicated SSH channel.  -F follows rotation (server restarts), lines
+    are delivered the moment they are written.  Auto-reconnects with
+    backoff when the channel dies (SSH drop, server reboot)."""
+
+    RECONNECT_MIN = 2.0
+    RECONNECT_MAX = 20.0
+
+    def __init__(self, ssh: SSHManager, server: Server, on_line,
+                 on_status=None) -> None:
+        self.ssh = ssh
+        self.server = server
+        self._on_line = on_line          # callable(str) from reader thread
+        self._on_status = on_status      # optional callable(str state)
+        self._alive = True
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="mcm-console-stream")
+
+    def start(self, backlog: int = 120) -> None:
+        self._backlog = backlog
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._alive = False
+        self._channel and self._channel.close()
+
+    _channel = None
+    _backlog = 120
+
+    def _run(self) -> None:
+        backoff = self.RECONNECT_MIN
+        while self._alive:
+            try:
+                logf = posixpath.join(self.server.mc_dir or ".",
+                                       "logs", "latest.log")
+                cmd = f"tail -n {self._backlog} -F {shq(logf)} 2>/dev/null"
+                stdout, chan = self.ssh.exec_channel(self.server, cmd)
+                self._channel = chan
+                backoff = self.RECONNECT_MIN
+                self._status("live")
+                buf = b""
+                while self._alive and not chan.closed:
+                    chunk = stdout.read(4096)   # blocks until data/close
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        self._emit(raw)
+                if buf:
+                    self._emit(buf)
+            except Exception:  # noqa: BLE001 - reconnect on ANY failure
+                pass
+            finally:
+                try:
+                    self._channel and self._channel.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._channel = None
+            if not self._alive:
+                return
+            self._status("reconnecting")
+            time.sleep(backoff)
+            backoff = min(backoff * 1.7, self.RECONNECT_MAX)
+
+    def _emit(self, raw: bytes) -> None:
+        text = ANSI_RE.sub("", raw.decode("utf-8", "replace")).rstrip("\r")
+        if text.strip():
+            try:
+                self._on_line(text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _status(self, state: str) -> None:
+        if self._on_status:
+            try:
+                self._on_status(state)
+            except Exception:  # noqa: BLE001
+                pass

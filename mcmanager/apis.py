@@ -1,7 +1,6 @@
 """Official API clients: PaperMC Fill v3, Fabric meta, Mojang, Forge, Modrinth."""
 from __future__ import annotations
 
-import re
 import tempfile
 from pathlib import Path
 
@@ -68,12 +67,25 @@ def paper_versions() -> list[str]:
     return versions
 
 
-def paper_jar_url(version: str) -> str:
+def paper_jar_info(version: str) -> dict:
+    """Latest Paper build for a version: url + sha256 checksum + size.
+
+    The checksum comes from the official PaperMC Fill API itself and is
+    what `updater` verifies on the server AFTER downloading (issue 28).
+    """
     data = _get_json(f"{PAPER_FILL}/projects/paper/versions/{version}/builds/latest")
-    url = (data.get("downloads") or {}).get("server:default", {}).get("url")
+    dl = (data.get("downloads") or {}).get("server:default", {})
+    url = dl.get("url")
     if not url:
         raise ApiError(f"No Paper build found for {version}.")
-    return url
+    sums = dl.get("checksums") or {}
+    return {"url": url, "sha256": sums.get("sha256", ""),
+            "sha1": sums.get("sha1", ""), "size": int(dl.get("size") or 0),
+            "build": data.get("build", "")}
+
+
+def paper_jar_url(version: str) -> str:
+    return paper_jar_info(version)["url"]
 
 
 # ================================ Fabric ==================================
@@ -97,16 +109,23 @@ def vanilla_versions() -> list[str]:
     return [v["id"] for v in data.get("versions", []) if v.get("type") == "release"]
 
 
-def vanilla_jar_url(version: str) -> str:
+def vanilla_jar_info(version: str) -> dict:
+    """Mojang server jar with its official sha1 (issue 28)."""
     data = _get_json(MOJANG_MANIFEST)
     for v in data.get("versions", []):
         if v.get("id") == version:
             meta = _get_json(v["url"])
-            url = (meta.get("downloads") or {}).get("server", {}).get("url")
-            if not url:
+            dl = (meta.get("downloads") or {}).get("server", {})
+            if not dl.get("url"):
                 raise ApiError(f"No server jar published for {version}.")
-            return url
+            return {"url": dl["url"], "sha1": dl.get("sha1", ""),
+                    "sha256": "", "size": int(dl.get("size") or 0),
+                    "build": ""}
     raise ApiError(f"Unknown vanilla version '{version}'.")
+
+
+def vanilla_jar_url(version: str) -> str:
+    return vanilla_jar_info(version)["url"]
 
 
 # ================================= Forge ==================================
@@ -138,6 +157,20 @@ def forge_installer_url(mc_version: str, promo: str) -> str:
         raise ApiError(f"No Forge build for {promo}.")
     return (f"https://maven.minecraftforge.net/net/minecraftforge/forge/"
             f"{mc_version}-{build}/forge-{mc_version}-{build}-installer.jar")
+
+
+def forge_installer_info(mc_version: str, promo: str) -> dict:
+    """Forge installer URL (+ maven-side .sha1 sidecar for verification)."""
+    url = forge_installer_url(mc_version, promo)
+    sha1 = ""
+    try:
+        r = requests.get(url + ".sha1", headers=UA, timeout=TIMEOUT)
+        if r.status_code == 200:
+            sha1 = r.text.strip().split()[0] if r.text.strip() else ""
+    except requests.RequestException:
+        pass
+    return {"url": url, "sha1": sha1, "sha256": "", "size": 0,
+            "build": promo}
 
 
 # =============================== Modrinth =================================

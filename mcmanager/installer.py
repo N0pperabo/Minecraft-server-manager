@@ -1,10 +1,12 @@
 """Automatic Minecraft server installer on the remote Linux machine.
-Mirrors MinecraftInstaller.kt: probe -> Java -> jar download -> config -> start."""
+probe -> Java (auto-managed, MC-version-aware) -> verified jar download
+-> config -> start."""
 from __future__ import annotations
 
 import re
 
 from . import apis
+from . import javas
 from .models import Server
 from .ssh_manager import SSHManager, shq
 
@@ -25,19 +27,8 @@ class SystemProbe:
         return f"OS: {self.os_id or 'unknown'}   PM: {pm}   {java}   {curl}"
 
 
-def required_java(mc_version: str) -> int:
-    parts = mc_version.split(".")
-    try:
-        major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
-        patch = int(parts[2]) if len(parts) > 2 else 0
-    except ValueError:
-        return 21
-    if (major, minor) > (1, 20):
-        return 21
-    if (major, minor) == (1, 20) and patch >= 5:
-        return 21
-    return 17
+# required_java lives in javas.py now (fixes MC 26.x -> Java 25, issue 1)
+required_java = javas.required_java
 
 
 class MinecraftInstaller:
@@ -67,30 +58,18 @@ class MinecraftInstaller:
         self.log(f"[probe] {probe.summary()}")
         return probe
 
-    def install_java(self, probe: SystemProbe, major: int) -> None:
-        m = re.search(r'version "(\d+)',
-                      self.run("java -version 2>&1 | head -1").stdout)
-        if m and int(m.group(1)) >= major:
-            self.log(f"[java] already have Java {m.group(1)} - skipping.")
-            return
-        pkg = probe.package_manager
-        self.log(f"[java] installing OpenJDK {major} via {pkg} (needs sudo)...")
-        if pkg == "apt-get":
-            script = (f"sudo apt-get update -y && "
-                      f"sudo apt-get install -y openjdk-{major}-jre-headless")
-        elif pkg in ("dnf", "yum"):
-            script = f"sudo {pkg} install -y java-{major}-openjdk-headless"
-        elif pkg == "apk":
-            script = f"sudo apk add openjdk{major}-jre"
-        else:
-            raise RuntimeError(
-                "No known package manager found. Install Java manually, then retry.")
-        res = self.run(script, timeout=600)
-        if res.exit_code != 0:
-            tail = (res.stderr or res.stdout).strip()[-800:]
-            raise RuntimeError(
-                "Java installation failed. Make sure the user has NOPASSWD sudo.\n" + tail)
-        self.log(f"[java] OpenJDK {major} installed.")
+    def install_java(self, probe: SystemProbe, major: int) -> str:
+        """Ensure a suitable JVM exists; returns the java path start.sh uses.
+
+        v2.0: discovers EVERY installed JVM first (a present Java 25 no
+        longer triggers a pointless OpenJDK 21 install), installs missing
+        runtimes user-locally from Temurin (no root), and only falls back
+        to the distro package manager (password piped to sudo -S - no
+        NOPASSWD:ALL, issue 4).
+        """
+        return javas.ensure_java(self.ssh, self.server,
+                                 self.server.mc_version,
+                                 probe.package_manager, self.log)
 
     def download_jar(self, platform: str, mc_version: str) -> str:
         """Download the server jar into the remote dir. Returns jar filename."""
@@ -146,16 +125,20 @@ class MinecraftInstaller:
             "level-seed=\n"
         )
         self.run(f"cd {d} && cat > server.properties << 'MCEOF'\n{props}MCEOF")
+        self.server.mc_port = port
 
         ram = max(1024, self.server.ram_mb)
+        # absolute java path when we provisioned a specific runtime (issue 1)
+        java_bin = self.server.java_path or "java"
+        extra = (" " + self.server.extra_jvm) if self.server.extra_jvm else ""
         if platform == "forge":
-            self.run(f"cd {d} && cat > user_jvm_args.txt << 'MCEOF'\n-Xmx{ram}M\nMCEOF")
+            self.run(f"cd {d} && cat > user_jvm_args.txt << 'MCEOF'\n-Xmx{ram}M{extra}\nMCEOF")
             self.run(
                 f"cd {d} && cat > start.sh << 'MCEOF'\n"
                 "#!/usr/bin/env bash\n"
                 "cd \"$(dirname \"$0\")\"\n"
                 "if [ -f run.sh ]; then exec bash run.sh; fi\n"
-                "exec java @user_jvm_args.txt -jar forge-installer.jar nogui\n"
+                f"exec {shq(java_bin)} @user_jvm_args.txt -jar forge-installer.jar nogui\n"
                 "MCEOF"
             )
         else:
@@ -165,11 +148,12 @@ class MinecraftInstaller:
                 f"cd {d} && cat > start.sh << 'MCEOF'\n"
                 "#!/usr/bin/env bash\n"
                 "cd \"$(dirname \"$0\")\"\n"
-                f"exec java -Xms512M -Xmx{ram}M -jar {jar} nogui\n"
+                f"exec {shq(java_bin)} -Xms512M -Xmx{ram}M{extra} -jar {jar} nogui\n"
                 "MCEOF"
             )
         self.run(f"cd {d} && chmod +x start.sh")
-        self.log("[config] eula.txt, server.properties and start.sh written.")
+        self.log("[config] eula.txt, server.properties and start.sh written "
+                 f"(java: {java_bin}).")
 
     def full_install(self, platform: str, mc_version: str, mc_dir: str,
                      port: int, ram_mb: int) -> None:
@@ -182,6 +166,7 @@ class MinecraftInstaller:
         self.log(f"[setup] creating directory {mc_dir}")
         self.run(f"mkdir -p {shq(mc_dir)}")
         self.install_java(probe, required_java(mc_version))
+        self.server.mc_version = mc_version
         jar = self.download_jar(platform, mc_version)
         if jar == "forge-installer.jar":
             self.run_forge_installer()
