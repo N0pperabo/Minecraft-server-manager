@@ -5,3 +5,4 @@ Pillow>=9.0
 
 # development / tests (optional)
 pytest>=7.0
+pytest-timeout>=2

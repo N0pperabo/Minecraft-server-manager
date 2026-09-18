@@ -122,6 +122,15 @@ class SSHManager:
                     pass
                 self._clients.pop(server.id, None)
 
+            # v2.0.2: a host key the user DECLINED this session must not
+            # produce endless TCP handshakes (fail2ban / sshd MaxStartups
+            # will drop or ban the client) - refuse before creating a
+            # client or touching the network.
+            if HOST_KEYS.declined(server.host):
+                raise SSHError(
+                    f"Host key for {server.host} was declined earlier - "
+                    "restart MC Manager to be asked again.")
+
             client = paramiko.SSHClient()
             # TOFU host-key verification instead of AutoAddPolicy (issue 3)
             HOST_KEYS.attach(client)

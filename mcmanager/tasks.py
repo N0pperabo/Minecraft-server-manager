@@ -1,5 +1,13 @@
 """Tiny background-task bridge: run work in threads, deliver results to the
-Tk main loop through a queue that the app drains every 100 ms."""
+Tk main loop through a queue that the app drains every 100 ms.
+
+v2.0.2 protocol fix: the queue now carries (kind, cb, args) and `emit()`
+accepts ANY number of callback arguments - including zero.  The v2.0.1
+signature `emit(cb, value)` demanded a second argument, so the host-key
+confirmation's `runner.emit(ask)` raised TypeError inside the TOFU policy;
+the policy swallowed it as "user refused" and EVERY first connection was
+rejected without the dialog ever being shown.
+"""
 from __future__ import annotations
 
 import os
@@ -18,31 +26,35 @@ class TaskRunner:
         def worker():
             try:
                 result = fn()
-                self.q.put((on_success, result, None))
+                self.q.put(("ok", on_success, (result,)))
             except Exception as exc:  # noqa: BLE001
                 if os.environ.get("MCM_DEBUG"):
                     traceback.print_exc()
                 else:
                     print(f"[task error] {type(exc).__name__}: {exc}")
-                self.q.put((on_error, None, exc))
+                self.q.put(("err", on_error, (exc,)))
         threading.Thread(target=worker, daemon=True).start()
 
-    def emit(self, cb, value) -> None:
-        """Post a value (e.g. a streamed log line) from any thread."""
-        self.q.put((cb, value, None))
+    def emit(self, cb, *args) -> None:
+        """Post a call from any thread; poll() runs cb(*args) on the Tk loop.
+
+        cb may take zero arguments (`emit(lambda: toast.show())`), one
+        (`emit(append_line, line)`) or several - whatever matches cb.
+        """
+        self.q.put(("ok", cb, args))
 
     # -- called only from the Tk main loop ----------------------------------
     def poll(self) -> int:
         handled = 0
         while True:
             try:
-                cb, result, err = self.q.get_nowait()
+                _kind, cb, args = self.q.get_nowait()
             except queue.Empty:
                 return handled
             handled += 1
             if cb is None:
                 continue
             try:
-                cb(err if err is not None else result)
+                cb(*args)
             except Exception:  # noqa: BLE001
                 traceback.print_exc()

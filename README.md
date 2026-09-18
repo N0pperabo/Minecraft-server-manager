@@ -1,4 +1,4 @@
-# MC Manager — Python Edition (v2.0.0)
+# MC Manager — Python Edition (v2.0.2)
 
 A desktop controller for Minecraft servers running on remote Linux machines
 (VPS, dedicated box, home server). Connect over SSH and manage everything —
@@ -10,6 +10,39 @@ Bukkit, Pufferfish, Fabric, Quilt, Forge, NeoForge, Vanilla, Mohist and
 popular proxies.
 
 ---
+
+## What's new in 2.0.2 (hotfix)
+
+- **Fixed the first-connection dialog never appearing**: an internal
+  `TypeError` made the app treat every new server as if you had clicked
+  "No" (`HostKeyChanged ... NOT accepted by the user`). The trust dialog
+  now opens properly on first connect.
+- **One dialog instead of a flood**: simultaneous connects to the same
+  server (status polling + your click) share a single confirmation dialog,
+  and the answer is remembered for the session.
+- **Declined servers stop retrying**: if you click "No", further attempts
+  are refused instantly WITHOUT contacting the server — no more endless
+  handshakes that can get your IP banned by fail2ban
+  (`WinError 10054`). Restart the app if you declined by mistake.
+- Background event toasts (crash/restart/backup notifications) now show
+  correctly (same root cause).
+
+## What's new in 2.0.1 (hotfix)
+
+- **Fixed a startup crash on Windows** (`PermissionError: ...\.mcmanager\known_hosts`):
+  a locked, unreadable or missing host-key file no longer kills every
+  connection. The store degrades to in-memory for the session and the app
+  shows one warning with the reason instead.
+- **Fixed a deadlock** in first-use host-key confirmation and in
+  Settings → Trusted hosts → Forget (a non-reentrant lock self-deadlocked
+  the connecting thread).
+- **Fixed silent data loss**: saving a newly trusted host key no longer
+  wipes previously trusted hosts from `known_hosts`.
+- Host-key saves are now **atomic** (temp file + rename) and self-heal a
+  stale read-only flag.
+- The credential vault survives a locked/unreadable key file by falling
+  back to a session key (stored passwords must be re-entered, but the app
+  keeps running).
 
 ## What's new in 2.0 (hardening release)
 
@@ -161,14 +194,28 @@ mcmanager/
   installer.py   full unattended installs
   ssh_manager.py paramiko layer (verified host keys, lock-free long ops)
   ui/            CustomTkinter pages and dialogs
-tests/           76-test pytest suite with a scripted FakeSSH
+tests/           97-test pytest suite with a scripted FakeSSH
 ```
 
 ## Troubleshooting
 
+- **"Permission denied: ...known_hosts" or a "host key file problem"
+  warning** — the file is locked by another program or has broken
+  permissions. The app keeps working (keys are remembered for the session
+  only). To fix it permanently, close other instances of the app and delete
+  the file, then restart:
+  `del "%USERPROFILE%\.mcmanager\known_hosts"` (Windows) or
+  `rm ~/.mcmanager/known_hosts` (Linux/macOS).
+- **"Host key ... NOT accepted"** — you clicked **No** on the trust dialog
+  (or it could not be shown). The app refuses that server for the rest of
+  the session without contacting it. Restart MC Manager to be asked again,
+  then click **Yes**.
 - **"HOST KEY CHANGED"** — the machine was reinstalled or something is
   intercepting the connection. Verify out-of-band, then Settings → Trusted
   hosts → Forget.
+- **"connection forcibly closed" (10054) / banner error** — the server or
+  a firewall (fail2ban) dropped repeated connections. Wait a few minutes
+  and connect once; the app no longer hammers the server after v2.0.2.
 - **Commands don't reach the server** — enable RCON from the Console page
   (one click) or restart the server from the Control page so the screen
   session is re-attached.

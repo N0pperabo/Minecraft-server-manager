@@ -173,13 +173,15 @@ class SettingsDialog(_Dialog):
     def _render_hosts(self):
         for w in self.hosts_box.winfo_children():
             w.destroy()
-        try:
-            import paramiko
-            hk = paramiko.HostKeys(str(HOST_KEYS.path))
-            entries = [(h, k.get_name()) for h in hk.keys()
-                       for k in (hk.lookup(h) or [])]
-        except Exception:  # noqa: BLE001
-            entries = []
+        # v2.0.1: read through HOST_KEYS (in-memory, fault-tolerant) instead
+        # of re-opening the file - a locked/unreadable known_hosts used to
+        # crash or silently show an empty list here.
+        entries = HOST_KEYS.entries()
+        if HOST_KEYS.last_error:
+            ctk.CTkLabel(self.hosts_box,
+                         text=f"host key file problem:\n{HOST_KEYS.last_error}",
+                         font=T.font(11), text_color=T.ACCENT, justify="left",
+                         wraplength=340).pack(pady=(10, 2), padx=10)
         if not entries:
             ctk.CTkLabel(self.hosts_box, text="no trusted hosts yet",
                          font=T.font(11), text_color=T.TEXT_DIM).pack(pady=14)

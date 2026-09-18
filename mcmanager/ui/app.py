@@ -27,7 +27,7 @@ from ..oplock import LOCKS
 from ..notify import NOTIFIER
 from ..sched import Scheduler
 from ..health import Watchdog
-from ..secure import HOST_KEYS
+from ..secure import HOST_KEYS, VAULT
 from . import wallpaper
 from .widgets import Toast
 
@@ -181,27 +181,40 @@ class MCManagerApp(ctk.CTk):
 
     # -- host key confirmation (issue 3) -----------------------------------------
     def _confirm_host_key(self, hostname: str, fingerprint: str) -> bool:
-        if not self.winfo_exists():
-            return True
+        """First-use host key confirmation; called from ANY worker thread.
+
+        The question is marshalled to the Tk main loop through the task
+        queue and this thread waits for the answer.
+
+        v2.0.2: fixes the v2.0.1 bug where `runner.emit(ask)` was missing
+        its argument -> TypeError inside the TOFU policy -> every first
+        connection was silently refused and the dialog NEVER appeared.
+        Also: no Tk calls from this (worker) thread - winfo_exists moved
+        inside the marshalled callback; fail CLOSED if the dialog cannot
+        be shown (never trust a key without asking)."""
         ev = threading.Event()
-        box = {"ok": False}
+        box = {"asked": False, "ok": False}
 
         def ask():
             try:
-                box["ok"] = messagebox.askyesno(
-                    "New SSH host key",
-                    f"First connection to:\n{hostname}\n\n"
-                    f"Host key fingerprint:\n{fingerprint}\n\n"
-                    "Trust and remember this key?\n\n"
-                    "(A changed key later will be REJECTED as a possible "
-                    "man-in-the-middle attack.)",
-                    parent=self)
+                if self.winfo_exists():
+                    box["asked"] = True
+                    box["ok"] = messagebox.askyesno(
+                        "New SSH host key",
+                        f"First connection to:\n{hostname}\n\n"
+                        f"Host key fingerprint:\n{fingerprint}\n\n"
+                        "Trust and remember this key?\n\n"
+                        "(A changed key later will be REJECTED as a possible "
+                        "man-in-the-middle attack.)",
+                        parent=self)
+            except Exception:  # noqa: BLE001 - window may be closing
+                pass
             finally:
                 ev.set()
 
-        self.runner.emit(ask)
-        ev.wait(timeout=120)
-        return box["ok"]
+        self.runner.emit(ask)          # zero-arg emit is valid again
+        ev.wait(timeout=300)           # dialog open for up to 5 minutes
+        return box["asked"] and box["ok"]
 
     # -- journal recovery on connect (issue 33) -----------------------------------
     def check_journal(self, srv: Server) -> None:
@@ -335,7 +348,7 @@ class MCManagerApp(ctk.CTk):
                       command=self._open_add)
         add_btn.pack(fill="x")
         wallpaper.blend_corners(add_btn)
-        vlbl = ctk.CTkLabel(footer, text="Python Edition v2.0.0", font=T.font(10),
+        vlbl = ctk.CTkLabel(footer, text="Python Edition v2.0.2", font=T.font(10),
                             text_color=T.TEXT_DIM)
         vlbl.pack(pady=(10, 0))
         wallpaper.blend_corners(vlbl)
@@ -497,9 +510,29 @@ class MCManagerApp(ctk.CTk):
             # re-sample corner-blended widgets that moved (layout settling,
             # window resize) - cheap winfo checks, no redraw when unchanged
             wallpaper.refresh_blends()
+            self._check_security_warnings()
         except Exception:  # noqa: BLE001
             pass
         self.after(100, self._tick)
+
+    # -- security store health (v2.0.1) -------------------------------------
+    # The host-key store and credential vault degrade to in-memory mode when
+    # their files are locked/unreadable instead of crashing connections
+    # (the v2.0.0 Windows bug).  Surface the reason ONCE so the user can fix
+    # the file; the checks are lazy so we poll cheaply from the tick loop.
+    _sec_warn_seen = ("", "")
+
+    def _check_security_warnings(self) -> None:
+        current = (HOST_KEYS.last_error, VAULT.last_error)
+        if current == self._sec_warn_seen:
+            return
+        seen_before = set(self._sec_warn_seen)
+        self._sec_warn_seen = current
+        for message in current:
+            if message and message not in seen_before:
+                NOTIFIER.publish("security", "MC Manager", message, ok=False)
+                short = message if len(message) <= 110 else message[:107] + "..."
+                self.toast.show(short, ok=False)
 
     def _on_close(self) -> None:
         try:
